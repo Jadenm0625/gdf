@@ -1,0 +1,804 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Kingdom — Grounded + Parallax + Sky Arc</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
+  <style>
+    html,body{margin:0;height:100%;background:#0c0f14;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Arial}
+    #game{width:100%;height:100%}
+    .hud{position:fixed;left:12px;top:10px;color:#e9f4ff;text-shadow:0 1px 2px rgba(0,0,0,.6);font-size:16px;line-height:1.2;z-index:10}
+    .hud b{font-weight:700}
+    .err{position:fixed;right:12px;top:12px;max-width:44ch;padding:10px 12px;background:#2b1a1a;color:#ffd7d7;border:1px solid #a33;border-radius:8px;font-size:12px;z-index:9999;display:none;white-space:pre-wrap}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+</head>
+<body>
+<div class="hud" id="hud"></div>
+<div class="err" id="errbox"></div>
+<div id="game"></div>
+
+<script>
+/* On-screen error box */
+(function(){
+  const box = document.getElementById('errbox');
+  window.onerror = function(msg, src, line, col, err){
+    box.style.display = 'block';
+    box.textContent = (msg||'Error') + '\n' + (src||'') + ':' + (line||'?') + ':' + (col||'?') + '\n' + (err && err.stack ? err.stack : '');
+  };
+  if (typeof Phaser === 'undefined'){
+    box.style.display = 'block';
+    box.textContent = 'Phaser failed to load. Check your internet connection (CDN).';
+  }
+})();
+</script>
+
+<script>
+(() => {
+  if (typeof Phaser === 'undefined') return;
+
+  const DESIGN_W = 1920, DESIGN_H = 1018;
+
+  // World sizing (1 ft = 12 px baseline from earlier)
+  const WORLD_FEET = 1000, WORLD_PX = WORLD_FEET*12; // 12,000 px
+  const ENV_SCALE = 3;          // everything except the king is 3x
+  const GROUND_BMP_H = 96;      // base ground art height (before scaling)
+  const GROUND_STRIP_H = GROUND_BMP_H * ENV_SCALE;
+
+  // Ground line we align everything to (top of ground strip)
+  const GROUND_Y_CENTER = DESIGN_H - 120;                // where the ground sprite is centered
+  const GROUND_TOP = GROUND_Y_CENTER - GROUND_STRIP_H/2; // y of the ground surface line
+
+  // Stats & costs
+  const PLAYER_MAX_HP = 15;
+  const PEASANT_MAX_HP = 4;
+  const ENEMY_MAX_HP = 3;
+  const WALL_MAX_HP = 2;
+  const DMG_ENEMY_HIT = 1;
+  const COST_WALL = 2;
+  const COST_RECRUIT = 1;
+
+  // Day/Night speeds (1..10 scale) – smaller = faster
+  const DAY_SPEED = 6;
+  const NIGHT_SPEED = 4;
+  const CYCLE_BASE = 0.08;
+
+  const config = {
+    type: Phaser.AUTO,
+    parent: 'game',
+    backgroundColor: '#0c0f14',
+    scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, width: DESIGN_W, height: DESIGN_H },
+    physics: { default: 'arcade', arcade: { gravity: { y: 1800 }, debug: false } },
+    scene: { preload, create, update }
+  };
+
+  new Phaser.Game(config);
+
+  // ---------- Small helpers ----------
+  function ellipse(ctx, cx, cy, rx, ry, alpha=1){
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+  }
+  function roundRect(ctx, x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y,   x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x,   y+h, r);
+    ctx.arcTo(x,   y+h, x,   y,   r);
+    ctx.arcTo(x,   y,   x+w, y,   r);
+    ctx.closePath();
+  }
+  function fillCircle(ctx, x,y,r, color){
+    if (color){ ctx.fillStyle = color; }
+    ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  }
+  function roundRectG(g, x,y,w,h,r, color){
+    const gg = g; gg.fillStyle(color,1);
+    gg.fillRect(x+r, y, w-2*r, h);
+    gg.fillRect(x, y+r, r, h-2*r);
+    gg.fillRect(x+w-r, y+r, r, h-2*r);
+    gg.fillCircle(x+r,   y+r,   r);
+    gg.fillCircle(x+w-r, y+r,   r);
+    gg.fillCircle(x+r,   y+h-r, r);
+    gg.fillCircle(x+w-r, y+h-r, r);
+  }
+  function mulberry32(a){ return function(){ var t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
+
+  // Painter helpers (textures) — guarded
+  function makePixelTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const g = scene.make.graphics({ x:0,y:0, add:false });
+    g.fillStyle(0xffffff).fillRect(0,0,w,h);
+    g.generateTexture(key, w, h);
+    g.destroy();
+  }
+  function makeGroundTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const g = scene.make.graphics({ x:0,y:0, add:false, antialias:true });
+    g.fillStyle(0x3b412e).fillRect(0, h*0.25, w, h*0.75);
+    g.fillStyle(0x4d6b3a).fillRect(0, 0, w, h*0.28);
+    for (let i=0;i<500;i++){
+      g.fillStyle(0x2b2f22, 0.25).fillRect(Math.random()*w, (Math.random()*h*0.75)+h*0.25, 2, 2);
+    }
+    g.generateTexture(key, w, h);
+    g.destroy();
+  }
+  function drawTreeTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const tex = scene.textures.createCanvas(key, w, h);
+    const ctx = tex.getContext(); ctx.imageSmoothingEnabled = true;
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = '#6a4a2f'; roundRect(ctx, w/2-4, h-52, 8, 52, 3); ctx.fill();
+    ctx.fillStyle = '#2b5c45'; ellipse(ctx, w/2, h-60, 28, 18, 0.95);
+    ctx.fillStyle = '#2e674c'; ellipse(ctx, w/2-14, h-72, 18, 12, 0.9);
+    ctx.fillStyle = '#2a5a44'; ellipse(ctx, w/2+15, h-70, 20, 14, 0.9);
+    ctx.fillStyle = '#2c6a4e'; ellipse(ctx, w/2, h-82, 16, 10, 0.85);
+    tex.refresh();
+  }
+  function drawWaterTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const tex = scene.textures.createCanvas(key, w, h);
+    const ctx = tex.getContext(); ctx.imageSmoothingEnabled = true;
+    const g = ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'#3b84a3'); g.addColorStop(1,'#1c536c');
+    ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+    for (let i=0;i<80;i++){
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fillRect(Math.random()*w, Math.random()*h, 24, 2);
+    }
+    tex.refresh();
+  }
+  function drawBridgeTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const tex = scene.textures.createCanvas(key, w, h);
+    const ctx = tex.getContext(); ctx.imageSmoothingEnabled = true;
+    ctx.fillStyle = '#7a5738'; roundRect(ctx, 0,0,w,h,4); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    for (let i=0;i<8;i++) ctx.fillRect(i*(w/8),0,3,h);
+    tex.refresh();
+  }
+  function drawCampfireTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle='#5b3b2b'; roundRect(c, w/2-12,h-10,24,8,3); c.fill();
+    c.fillStyle='#ff9933'; ellipse(c, w/2, h-20, 10,14,1);
+    c.fillStyle='#ffd966'; ellipse(c, w/2, h-23, 6,10,1);
+    t.refresh();
+  }
+  function drawTentTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle='#2a3f6b';
+    c.beginPath(); c.moveTo(0,h-6); c.lineTo(w/2,h-64); c.lineTo(w,h-6); c.closePath(); c.fill();
+    c.fillStyle='#1b2744'; roundRect(c, w/2-7,h-42,14,36,3); c.fill();
+    t.refresh();
+  }
+  function drawChestTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle='#6b4b2c'; roundRect(c, 0,h-22,w,22,3); c.fill();
+    c.fillStyle='#c8b35a'; roundRect(c, w/2-4,h-22,8,22,2); c.fill();
+    t.refresh();
+  }
+  function drawMarkerTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle='#e1d995'; roundRect(c, 2,0,w-4,10,3); c.fill();
+    c.fillStyle='#c8b35a'; roundRect(c, w/2-2, 8, 4, h-10, 2); c.fill();
+    t.refresh();
+  }
+  function drawWallTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle='#6a6a6a'; roundRect(c, 0,0,w,h,3); c.fill();
+    c.fillStyle='rgba(0,0,0,0.25)'; for(let i=0;i<5;i++) c.fillRect(i*(w/5),0,2,h);
+    t.refresh();
+  }
+  function drawCampPostTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle = '#6b4b2c'; roundRect(c, w/2-3, 6, 6, h-10, 3); c.fill();
+    c.fillStyle = '#c8b35a'; roundRect(c, w/2-5, 2, 10, 6, 2); c.fill();
+    c.fillStyle = '#3a5b7a'; roundRect(c, w/2+3, 12, w/2-6, 16, 2); c.fill();
+    t.refresh();
+  }
+  function paintEnemyTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    c.fillStyle='#7a2b2b'; roundRect(c, 0,0,w,h,6); c.fill();
+    c.fillStyle='#000'; roundRect(c, 8,10,w-16,h-20,4); c.fill();
+    t.refresh();
+  }
+  function paintHumanTexture(scene, key, w, h, opts={}){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext(); c.imageSmoothingEnabled = true;
+    const skin = '#d8b78a', tunic = opts.tunic || '#3d5b3a', pants = '#2a2a2a', boots = '#3a2c25';
+    roundRect(c, w/2-12, h-80, 24, 42, 6); c.fillStyle=tunic; c.fill();
+    fillCircle(c, w/2, h-92, 12, skin);
+    c.fillStyle='#593d2b'; fillCircle(c, w/2-4, h-95, 1.6); fillCircle(c, w/2+4, h-95, 1.6);
+    c.fillStyle='#3b2a20'; c.fillRect(w/2-6, h-100, 12, 2);
+    c.fillStyle='#7d5a3f'; roundRect(c, w/2-2, h-92, 4, 3, 1); c.fill();
+    c.fillStyle='#6d4a36'; roundRect(c, w/2-5, h-88, 10, 3, 1); c.fill();
+    c.fillStyle=pants; roundRect(c, w/2-10, h-38, 8, 16, 2); c.fill();
+    c.fillStyle=pants; roundRect(c, w/2+2,  h-38, 8, 16, 2); c.fill();
+    c.fillStyle=boots; roundRect(c, w/2-11, h-22, 12, 6, 2); c.fill();
+    c.fillStyle=boots; roundRect(c, w/2+1,  h-22, 12, 6, 2); c.fill();
+    t.refresh();
+  }
+  function paintSkyTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    const g = c.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'#0b1b2a'); g.addColorStop(0.45,'#0f2a3b'); g.addColorStop(1,'#132f25');
+    c.fillStyle = g; c.fillRect(0,0,w,h);
+    t.refresh();
+  }
+  function paintForestSilhouette(scene, key, w, h, color){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.clearRect(0,0,w,h);
+    c.fillStyle = '#'+color.toString(16).padStart(6,'0');
+    c.fillRect(0, h-60, w, 60);
+    const rnd = mulberry32((key==='forest_far')?101:202);
+    for (let i=0;i<100;i++){ // fewer = more spaced
+      const x = Math.floor(rnd()*w);
+      const base = h-60 + Math.floor(rnd()*18);
+      const height = 40 + Math.floor(rnd()*70);
+      c.fillRect(x-1, base-height, 2, height);
+      ellipse(c, x, base-height+10, 14 + rnd()*14, 18 + rnd()*12, 1);
+    }
+    t.refresh();
+  }
+  function paintFogTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    const g = c.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'rgba(200,220,210,0)');
+    g.addColorStop(1,'rgba(200,220,210,0.6)');
+    c.fillStyle = g; c.fillRect(0,0,w,h);
+    t.refresh();
+  }
+
+  // ---------- Scene state ----------
+  let cursors, keyA, keyD, keyW, keyE, keyZero;
+  let cam, ground, king;
+  let worldWidth = WORLD_PX;
+  let hudEl;
+  let gold = 6;
+  let playerHP = PLAYER_MAX_HP;
+
+  // Cycle / background
+  let sun, moon, lightOverlay;
+  let cycleT = 0.1; // 0..1 (0..0.5 day, 0.5..1 night)
+  let isDay = true;
+
+  // Parallax background layers
+  let bgSky, bgFar, bgMid, bgFog;
+
+  // Entities
+  let wallMarkers = [];
+  let wallsGroup, peasantsGroup, enemiesGroup, bridgesGroup, watersGroup, treeTrunksGroup;
+
+  function preload(){}
+
+  function create() {
+    const s = this;
+    hudEl = document.getElementById('hud');
+    makePixelTexture(s, 'px', 2, 2);
+
+    // Parallax background
+    makeBackgroundLayers(s);
+
+    // Ground (physics)
+    makeGroundTexture(s, 'groundTile', 512, GROUND_BMP_H);
+    ground = s.add.tileSprite(worldWidth/2, GROUND_Y_CENTER, worldWidth, GROUND_BMP_H, 'groundTile')
+               .setOrigin(0.5,0.5).setScale(ENV_SCALE, ENV_SCALE);
+    s.physics.add.existing(ground, true);
+
+    // Groups
+    wallsGroup = s.physics.add.staticGroup();
+    peasantsGroup = s.physics.add.group();
+    enemiesGroup = s.physics.add.group();
+    bridgesGroup = s.physics.add.staticGroup();
+    watersGroup  = s.physics.add.staticGroup();
+    treeTrunksGroup = s.physics.add.staticGroup();
+
+    // Trees + gaps -> water/bridges
+    const treePositions = generateTreePositions();
+    paintTreesAndGapsAsWater(s, treePositions, watersGroup, bridgesGroup, treeTrunksGroup);
+
+    // Player + anims (king unchanged height/head; beefier limbs)
+    const frames = makeKingWalkFrames(s);
+    s.anims.create({ key:'king-walk', frames: frames.map(k=>({key:k})), frameRate:8, repeat:-1 });
+    s.anims.create({ key:'king-idle', frames:[{key:frames[0]}], frameRate:1, repeat:-1 });
+
+    // Start slightly above ground; physics will set him onto the surface
+    king = s.physics.add.sprite(worldWidth/2, GROUND_TOP - 100, frames[0]).setScale(1.5);
+    king.setCollideWorldBounds(true).setDragX(1200).setMaxVelocity(400, 2200);
+    king.body.setSize(38, 98, true);
+    s.physics.add.collider(king, ground);
+    s.physics.add.collider(king, bridgesGroup);
+    s.physics.add.collider(king, treeTrunksGroup);
+    s.physics.add.collider(king, wallsGroup);
+
+    // Camp (center) — all bottom-anchored to ground line
+    buildCampAt(s, worldWidth/2);
+
+    // Wall markers & walls
+    wallMarkers = createWallMarkers(s, worldWidth/2, 9, 300); // spaced out a bit more
+    s.physics.add.collider(peasantsGroup, wallsGroup);
+    s.physics.add.collider(enemiesGroup, wallsGroup);
+
+    // Peasant camps
+    spawnPeasantCamps(s, 6);
+
+    // Colliders
+    s.physics.add.collider(peasantsGroup, ground);
+    s.physics.add.collider(peasantsGroup, bridgesGroup);
+    s.physics.add.collider(peasantsGroup, treeTrunksGroup);
+
+    s.physics.add.collider(enemiesGroup, ground);
+    s.physics.add.collider(enemiesGroup, bridgesGroup);
+    s.physics.add.collider(enemiesGroup, treeTrunksGroup);
+
+    // Overlaps / damage
+    s.physics.add.overlap(enemiesGroup, wallsGroup, (enemy, wall)=>enemyAttackWall(s, enemy, wall));
+    s.physics.add.overlap(enemiesGroup, king, ()=>damagePlayer(s, DMG_ENEMY_HIT));
+    s.physics.add.overlap(enemiesGroup, peasantsGroup, (e,p)=>damagePeasant(s,p,DMG_ENEMY_HIT));
+
+    // Camera
+    s.physics.world.setBounds(0, 0, worldWidth, DESIGN_H);
+    cam = s.cameras.main;
+    cam.setBounds(0, 0, worldWidth, DESIGN_H);
+    cam.startFollow(king, true, 0.15, 0.15);
+
+    // Input
+    cursors = s.input.keyboard.createCursorKeys();
+    keyA = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
+    keyD = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
+    keyW = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W);
+    keyE = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+    keyZero = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ZERO);
+    keyZero.on('down', () => { if (!s.scale.isFullscreen) s.scale.startFullscreen(); else s.scale.stopFullscreen(); });
+
+    s.input.keyboard.on('keydown-E', () => tryInteract(s));
+
+    // Sky actors
+    makeCycleActors(s);
+
+    updateHUD();
+
+    // Night enemy trickle
+    s.time.addEvent({ delay: 1000, loop: true, callback: () => { if (!isDay) spawnEnemyWave(s); }});
+  }
+
+  function update() {
+    const s = this;
+    const left = keyA.isDown || cursors.left.isDown;
+    const right = keyD.isDown || cursors.right.isDown;
+    const jump = keyW.isDown || cursors.up.isDown;
+    const onGround = king.body.blocked.down;
+
+    if (left) {
+      king.setAccelerationX(-1800);
+      king.setFlipX(true);
+      if (onGround) king.play('king-walk', true);
+    } else if (right) {
+      king.setAccelerationX(1800);
+      king.setFlipX(false);
+      if (onGround) king.play('king-walk', true);
+    } else {
+      king.setAccelerationX(0);
+      if (onGround) king.play('king-idle', true);
+    }
+    if (jump && onGround) king.setVelocityY(-650);
+
+    // Cycle tick
+    tickDayNight(this, this.game.loop.delta/1000);
+
+    // Parallax follow
+    const cx = cam.scrollX;
+    bgSky.x = -cx * 0.10;
+    bgFar.x = -cx * 0.25;
+    bgMid.x = -cx * 0.45;
+    bgFog.x = -cx * 0.65;
+  }
+
+  // ---------- Background & Cycle ----------
+  function makeBackgroundLayers(s){
+    paintSkyTexture(s, 'sky_big', 8192, DESIGN_H);
+    paintForestSilhouette(s, 'forest_far', 8192, 340, 0x112018);
+    paintForestSilhouette(s, 'forest_mid',  8192, 420, 0x1a2b20);
+    paintFogTexture(s, 'fog_strip', 8192, 280);
+
+    bgSky = s.add.image(0, 0, 'sky_big').setOrigin(0,0).setScrollFactor(0);
+    bgFar = s.add.image(0, DESIGN_H*0.60, 'forest_far').setOrigin(0,0.5).setScrollFactor(0).setAlpha(0.9);
+    bgMid = s.add.image(0, DESIGN_H*0.68, 'forest_mid').setOrigin(0,0.5).setScrollFactor(0).setAlpha(0.95);
+    bgFog = s.add.image(0, DESIGN_H*0.72, 'fog_strip').setOrigin(0,0.5).setScrollFactor(0).setAlpha(0.35);
+  }
+
+  let sun, moon, lightOverlay;
+  let cycleT = 0.0; // 0..1 -> full cycle; 0..0.5 day (sun), 0.5..1 night (moon)
+  let isDay = true;
+
+  function makeCycleActors(s){
+    sun = s.add.circle(0,0,22,0xffe38a).setScrollFactor(0);
+    moon = s.add.circle(0,0,16,0xdfe6ff).setScrollFactor(0).setAlpha(0);
+    lightOverlay = s.add.rectangle(0,0,DESIGN_W,DESIGN_H,0x000000,0.0)
+                      .setOrigin(0,0).setScrollFactor(0).setDepth(1000);
+  }
+
+  // Full circular path across the top: sun goes left->right upper arc, moon returns right->left upper arc
+  function tickDayNight(s, dt){
+    const speed = isDay ? (CYCLE_BASE / DAY_SPEED) : (CYCLE_BASE / NIGHT_SPEED);
+    cycleT += speed * dt;
+    if (cycleT >= 1) cycleT -= 1;
+
+    isDay = (cycleT < 0.5);
+    // Map to 0..PI for sun, PI..2PI for moon
+    const angleFull = (cycleT * 2 * Math.PI);
+    const R = Math.min(DESIGN_W, DESIGN_H) * 0.55;   // radius of arc
+    const cx = DESIGN_W/2;
+    const cy = 30;                                   // near top of screen
+
+    if (isDay){
+      const a = angleFull;                           // 0..PI
+      const x = cx + Math.cos(a) * R;
+      const y = cy + Math.sin(a) * R * 0.45;        // squash to keep near top
+      sun.setPosition(x, y).setAlpha(1);
+      moon.setAlpha(0);
+    } else {
+      const a = angleFull;                           // PI..2PI
+      const x = cx + Math.cos(a) * R;
+      const y = cy + Math.sin(a) * R * 0.45;
+      moon.setPosition(x, y).setAlpha(1);
+      sun.setAlpha(0);
+    }
+
+    // Ambient darkness
+    const t = cycleT;
+    const darkness = isDay ? (0.15 + 0.15*Math.sin(Math.PI*(t/0.5))) * 0.5
+                           : (0.35 + 0.45*Math.sin(Math.PI*((t-0.5)/0.5)));
+    lightOverlay.fillAlpha = Phaser.Math.Clamp(darkness, 0, 0.85);
+  }
+
+  // ---------- Terrain / Water / Bridges / Trees ----------
+  function generateTreePositions(){
+    // Sparser: longer gaps and wider spacing
+    const positions = [];
+    const rng = mulberry32(4242);
+    let x = 120;
+    while (x < worldWidth-120){
+      const gapChance = rng();
+      if (gapChance < 0.20){
+        // big empty gap (lake/meadow opportunity)
+        x += 260 + Math.floor(rng()*260);
+      } else {
+        // smaller, looser clusters
+        const n = 2 + Math.floor(rng()*4);
+        for (let i=0;i<n;i++){
+          positions.push(x);
+          x += 54 + Math.floor(rng()*36);
+        }
+        x += 120 + Math.floor(rng()*180);
+      }
+    }
+    // keep spawn area open
+    return positions.filter(px => Math.abs(px - worldWidth/2) > 200);
+  }
+
+  function paintTreesAndGapsAsWater(s, treeXs, waterGroup, bridgeGroup, trunksGroup){
+    if (!s.textures.exists('tree1')) drawTreeTexture(s, 'tree1', 64, 108);
+
+    // Place trees with bottom at ground line
+    treeXs.forEach(px => {
+      const ti = s.add.image(px, GROUND_TOP, 'tree1')
+        .setOrigin(0.5,1)
+        .setTint(0x2b5c45 + Math.floor(Math.random()*0x002200))
+        .setScale(ENV_SCALE);
+
+      // trunk collider aligned to ground
+      const trunkH = 80*ENV_SCALE, trunkW = 18*ENV_SCALE;
+      const trunk = trunksGroup.create(px, GROUND_TOP - trunkH/2, 'px')
+        .setDisplaySize(trunkW, trunkH).setVisible(false);
+      trunk.refreshBody();
+    });
+
+    // Identify long gaps -> water + bridge
+    const step = 40; // coarser index for spacing
+    const occupied = new Array(Math.floor(worldWidth/step)).fill(false);
+    treeXs.forEach(px => { const idx = Math.floor(px/step); occupied[idx] = true; });
+
+    let i = 2;
+    while (i < occupied.length-2){
+      if (!occupied[i]){
+        let j = i;
+        while (j < occupied.length && !occupied[j]) j++;
+        const gapLen = (j-i)*step;
+        if (gapLen >= 260){
+          const wx = i*step + gapLen/2;
+          addWaterWithBridge(s, wx, gapLen-80, waterGroup, bridgeGroup);
+        }
+        i = j+1;
+      } else i++;
+    }
+  }
+
+  function addWaterWithBridge(s, centerX, width, waterGroup, bridgeGroup){
+    const w = Phaser.Math.Clamp(width, 220, 520);
+    if (!s.textures.exists('waterTex')) drawWaterTexture(s, 'waterTex', 512, 64);
+    if (!s.textures.exists('bridgeTex')) drawBridgeTexture(s, 'bridgeTex', 256, 32);
+
+    // Water sits just below ground
+    const waterY = GROUND_TOP + 18;
+    const tiles = Math.ceil(w/256);
+    for (let k=0;k<tiles;k++){
+      s.add.tileSprite(centerX - (tiles*256)/2 + k*256 + 128, waterY, 256, 64, 'waterTex')
+        .setOrigin(0.5,0).setDepth(-1).setScale(ENV_SCALE);
+    }
+
+    // Bridge rests on ground line
+    const bridgeWidth = w - 40;
+    const bridgeTiles = Math.ceil(bridgeWidth/256);
+    const bridgeH = 18*ENV_SCALE;
+    for (let k=0;k<bridgeTiles;k++){
+      const bx = centerX - (bridgeTiles*256)/2 + k*256 + 128;
+      s.add.image(bx, GROUND_TOP, 'bridgeTex').setOrigin(0.5,1).setScale(ENV_SCALE);
+      const body = bridgeGroup.create(bx, GROUND_TOP - bridgeH/2, 'px')
+        .setDisplaySize(256*ENV_SCALE, bridgeH).setVisible(false);
+      body.refreshBody();
+    }
+  }
+
+  // ---------- Camp / Walls / Interact ----------
+  function buildCampAt(s, cx){
+    if (!s.textures.exists('campfire')) drawCampfireTexture(s, 'campfire', 48, 48);
+    if (!s.textures.exists('tent')) drawTentTexture(s, 'tent', 120, 80);
+    if (!s.textures.exists('chest')) drawChestTexture(s, 'chest', 48, 32);
+
+    s.add.image(cx-24, GROUND_TOP, 'campfire').setOrigin(0.5,1).setDepth(5).setScale(ENV_SCALE);
+    s.add.image(cx+70, GROUND_TOP, 'tent').setOrigin(0.5,1).setScale(ENV_SCALE);
+    s.add.image(cx+8,  GROUND_TOP, 'chest').setOrigin(0.5,1).setScale(ENV_SCALE);
+  }
+
+  function createWallMarkers(s, center, countPerSide, spacing){
+    const markers = [];
+    if (!s.textures.exists('marker')) drawMarkerTexture(s, 'marker', 16, 36);
+    for (let dir of [-1,1]){
+      for (let i=1;i<=countPerSide;i++){
+        const x = center + dir * i * spacing;
+        const m = s.add.image(x, GROUND_TOP, 'marker').setOrigin(0.5,1).setScale(ENV_SCALE);
+        m.data = { bought:false };
+        markers.push(m);
+      }
+    }
+    return markers;
+  }
+
+  function tryInteract(s){
+    const nearMarker = wallMarkers.find(m => Math.abs(m.x - king.x) < 56);
+    if (nearMarker && !nearMarker.data.bought && gold >= COST_WALL){
+      gold -= COST_WALL;
+      nearMarker.data.bought = true;
+      if (!s.textures.exists('wall')) drawWallTexture(s, 'wall', 24, 56);
+
+      // Wall art bottom on ground
+      s.add.image(nearMarker.x, GROUND_TOP, 'wall').setOrigin(0.5,1).setScale(ENV_SCALE);
+
+      // Wall collider centered on its height and aligned to ground
+      const wallH = 80*ENV_SCALE;
+      const wall = wallsGroup.create(nearMarker.x, GROUND_TOP - wallH/2, 'px')
+        .setDisplaySize(26*ENV_SCALE, wallH).setVisible(false);
+      wall.hp = WALL_MAX_HP; wall.refreshBody();
+
+      nearMarker.setVisible(false);
+      updateHUD();
+      return;
+    }
+    const nearPeasant = peasantsGroup.getChildren().find(p => Phaser.Math.Distance.Between(p.x,p.y, king.x,king.y) < 56 && !p.following);
+    if (nearPeasant && gold >= COST_RECRUIT){
+      gold -= COST_RECRUIT;
+      nearPeasant.following = true;
+      updateHUD();
+      return;
+    }
+  }
+
+  // ---------- Enemies / Damage ----------
+  function spawnEnemyWave(s){
+    for (let edge of [24, worldWidth-24]){
+      if (Math.random() < 0.5){
+        if (!s.textures.exists('enemy')) paintEnemyTexture(s, 'enemy', 40, 40);
+        const e = s.physics.add.sprite(edge, GROUND_TOP - 120, 'enemy').setScale(ENV_SCALE);
+        e.setCollideWorldBounds(true);
+        e.hp = ENEMY_MAX_HP;
+        e.setVelocityX(edge < worldWidth/2 ? 90+Math.random()*40 : -90 - Math.random()*40);
+        enemiesGroup.add(e);
+      }
+    }
+  }
+  function enemyAttackWall(s, enemy, wall){
+    if (!wall.hp) wall.hp = WALL_MAX_HP;
+    if (!enemy.nextHit || s.time.now > enemy.nextHit){
+      wall.hp -= DMG_ENEMY_HIT;
+      enemy.nextHit = s.time.now + 500;
+      if (wall.hp <= 0) wall.destroy();
+    }
+  }
+  function damagePlayer(s, dmg){
+    if (!king.nextHit || s.time.now > king.nextHit){
+      playerHP -= dmg;
+      king.nextHit = s.time.now + 500;
+      if (playerHP <= 0){
+        playerHP = PLAYER_MAX_HP; gold = Math.max(0, gold-1);
+        king.setPosition(worldWidth/2, GROUND_TOP - 140);
+      }
+      updateHUD();
+    }
+  }
+  function damagePeasant(s, peasant, dmg){
+    if (!peasant.hp) peasant.hp = PEASANT_MAX_HP;
+    if (!peasant.nextHit || s.time.now > peasant.nextHit){
+      peasant.hp -= dmg;
+      peasant.nextHit = s.time.now + 500;
+      if (peasant.hp <= 0) peasant.destroy();
+    }
+  }
+
+  // ---------- Peasants ----------
+  function spawnPeasantCamps(s, count){
+    if (!s.textures.exists('campPost')) drawCampPostTexture(s, 'campPost', 36, 44);
+    if (!s.textures.exists('peasantHuman')) paintHumanTexture(s,'peasantHuman', 80, 110, {tunic:'#2f4f3f'});
+    for (let i=0;i<count;i++){
+      const side = (Math.random()<0.5)?-1:1;
+      const dist = 480 + Math.random()* (worldWidth*0.4);
+      const x = worldWidth/2 + side*dist;
+
+      s.add.image(x, GROUND_TOP, 'campPost').setOrigin(0.5,1).setScale(ENV_SCALE);
+
+      // Spawn them above ground so they drop onto it (prevents clipping)
+      const p = s.physics.add.sprite(x+Phaser.Math.Between(-30,30), GROUND_TOP - 140, 'peasantHuman').setScale(ENV_SCALE*0.85);
+      p.setCollideWorldBounds(true);
+      p.hp = PEASANT_MAX_HP;
+      p.following = false;
+      peasantsGroup.add(p);
+    }
+  }
+
+  // ---------- HUD ----------
+  function updateHUD(){
+    document.getElementById('hud').innerHTML =
+      `<b>Gold:</b> ${gold} &nbsp; <b>HP:</b> ${playerHP}/${PLAYER_MAX_HP} &nbsp; ` +
+      `<b>Time:</b> ${isDay?'Day':'Night'} &nbsp; ` +
+      `<b>Controls:</b> A/D move · W jump · E interact · 0 fullscreen`;
+  }
+
+  // ---------- King (beefier limbs, same height & head, realistic face) ----------
+  function makeKingWalkFrames(scene){
+    const torsoH = 38;
+    const headR  = 16;     // same head size
+    const legLen = 44;     // keep height
+    const armLen = 36;     // keep reach
+    const limbThick = 14;  // beefed up
+
+    const skin   = 0xd8b78a, tunic  = 0x2d3a6b, belt = 0x5b3b2b, boots = 0x3a2c25,
+          cape   = 0x7a1a1a, crown = 0xffd24d, outline=0x111111;
+
+    const frameKeys = [];
+    const steps = [
+      { swing:  18, armOpp: -18 },
+      { swing:   6, armOpp:  -6 },
+      { swing: -18, armOpp:  18 },
+      { swing:  -6, armOpp:   6 },
+    ];
+    steps.forEach((st,i)=>{
+      const key = `king_walk_${i}`;
+      drawKing(scene, key, { torsoH, headR, legLen, armLen, limbThick, skin,tunic,belt,boots,cape,crown,outline, legSwingDeg:st.swing, armSwingDeg:st.armOpp });
+      frameKeys.push(key);
+    });
+    drawKing(scene, 'king_air', { torsoH, headR, legLen, armLen, limbThick, skin,tunic,belt,boots,cape,crown,outline, legSwingDeg:0, armSwingDeg:0, airborne:true });
+    return frameKeys;
+  }
+  function drawKing(scene, key, opts){
+    const { torsoH, headR, legLen, armLen, limbThick, skin,tunic,belt,boots,cape,crown,outline, legSwingDeg=0, armSwingDeg=0, airborne=false } = opts;
+    const W=180,H=180, cx=W/2, footY=H-10;
+    const g = scene.make.graphics({x:0,y:0,add:false});
+    const deg2rad = d=>d*Math.PI/180;
+
+    function line(x1,y1,x2,y2,thick,color){ g.lineStyle(thick,color,1); g.beginPath(); g.moveTo(x1,y1); g.lineTo(x2,y2); g.strokePath(); }
+    function rect(x,y,w,h,c){ g.fillStyle(c).fillRect(x,y,w,h); }
+    function circ(x,y,r,c){ g.fillStyle(c).fillCircle(x,y,r); }
+    function orect(x,y,w,h){ g.lineStyle(2, outline,1).strokeRect(x,y,w,h); }
+
+    const hipY = footY - legLen, hipX = cx;
+    const swing = deg2rad(legSwingDeg);
+    const stepLen = 10;
+    const frontHipX = hipX + Math.sin(swing)*stepLen;
+    const backHipX  = hipX - Math.sin(swing)*stepLen;
+    const kneeOffset = 12;
+
+    const armSwing = deg2rad(armSwingDeg);
+    const shoulderY = hipY - torsoH + 12;
+    const shoulderX = cx;
+
+    // Cape
+    g.fillStyle(cape,1);
+    roundRectG(g, cx-28, hipY - torsoH + 6, 56, legLen + 22, 8, cape);
+    g.lineStyle(2, outline,0.7).strokeRect(cx-28, hipY - torsoH + 6, 56, legLen + 22);
+
+    // Back leg
+    leg(backHipX, hipY, -legSwingDeg);
+
+    // Torso
+    const torsoW = 38;
+    roundRectG(g, cx - torsoW/2, hipY - torsoH, torsoW, torsoH, 6, tunic);
+    g.lineStyle(2, outline,1).strokeRect(cx - torsoW/2, hipY - torsoH, torsoW, torsoH);
+
+    // Belt
+    roundRectG(g, cx - torsoW/2, hipY - 14, torsoW, 7, 3, belt);
+    g.lineStyle(1.5, outline,1).strokeRect(cx - torsoW/2, hipY - 14, torsoW, 7);
+
+    // Head + facial features + crown
+    const neckY = hipY - torsoH - 4;
+    circ(cx, neckY - headR, headR, skin);
+    g.lineStyle(2, outline,1).strokeCircle(cx, neckY - headR, headR);
+    g.fillStyle(0x593d2b,1); g.fillCircle(cx-5, neckY - headR + 6, 2); g.fillCircle(cx+5, neckY - headR + 6, 2);
+    line(cx-8, neckY - headR + 2, cx-2, neckY - headR + 2, 2, 0x3b2a20);
+    line(cx+2, neckY - headR + 2, cx+8, neckY - headR + 2, 2, 0x3b2a20);
+    roundRectG(g, cx-2, neckY - headR + 8, 4, 4, 1, 0x7d5a3f);
+    roundRectG(g, cx-6, neckY - headR + 14, 12, 3, 1.5, 0x6d4a36);
+    g.fillStyle(0xffd24d,1);
+    g.fillRect(cx - headR + 2, neckY - headR*2 + 6, headR*2 - 4, 8);
+    for(let i=0;i<3;i++){
+      const sx = cx - headR + 6 + i*(headR*2-12)/2, sy = neckY - headR*2 + 6;
+      g.fillTriangle(sx,sy, sx+8,sy, sx+4,sy-8);
+    }
+    g.lineStyle(2, outline,1).strokeRect(cx - headR + 2, neckY - headR*2 + 6, headR*2 - 4, 8);
+
+    // Arms & front leg
+    arm(shoulderX-2, shoulderY, -armSwingDeg);
+    leg(frontHipX, hipY, legSwingDeg);
+    arm(shoulderX+2, shoulderY, armSwingDeg);
+
+    g.generateTexture(key, W, H); g.destroy();
+
+    function leg(hx,hy,deg){
+      const ang = deg2rad(deg);
+      const kx = hx + Math.sin(ang)*kneeOffset;
+      const ky = hy + Math.cos(ang)*kneeOffset;
+      const fx = hx + Math.sin(ang)*(legLen);
+      let fy = hy + Math.cos(ang)*(legLen);
+      if (!airborne) fy = Math.max(fy, H-10);
+      line(hx,hy,kx,ky, limbThick, 0x2a2a2a);
+      line(kx,ky,fx,fy, limbThick, 0x2a2a2a);
+      roundRectG(g, fx-12, fy-7, 24, 9, 3, boots);
+      g.lineStyle(2, outline,1).strokeRect(fx-12, fy-7, 24, 9);
+    }
+    function arm(sx,sy,deg){
+      const ang = deg2rad(deg);
+      const ex = sx + Math.sin(ang)*(armLen*0.55);
+      const ey = sy + Math.cos(ang)*(armLen*0.55);
+      const hx = sx + Math.sin(ang)*(armLen);
+      const hy = sy + Math.cos(ang)*(armLen);
+      line(sx,sy,ex,ey, limbThick-2, 0x262626);
+      line(ex,ey,hx,hy, limbThick-2, 0x262626);
+      g.fillStyle(0xd8b78a,1); g.fillCircle(hx,hy,4.2);
+      g.lineStyle(1.5, outline,1).strokeCircle(hx,hy,4.2);
+    }
+  }
+
+})();
+</script>
+</body>
+</html>
