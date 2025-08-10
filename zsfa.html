@@ -1,0 +1,178 @@
+--- a/kingdom_phase2_plus.html
++++ b/kingdom_phase2_plus.html
+@@ -39,7 +39,12 @@
+   const DESIGN_W = 1920, DESIGN_H = 1018;
+   const WORLD_FEET = 1000, WORLD_PX = WORLD_FEET*12; // 12,000 px
+-  const GROUND_Y = DESIGN_H - 120;
++  // Global vertical offset for EVERYTHING except background
++  const Y_OFFSET = 100;
++  // Scale up EVERYTHING except background and the King
++  const SCALE_WORLD = 3;
++  // Raise world floor so the whole world drops visually by +100px
++  const GROUND_Y = (DESIGN_H - 120) + Y_OFFSET;
+
+   // Stats & costs
+   const PLAYER_MAX_HP = 15;
+@@ -103,7 +108,10 @@
+     // Ground
+     makeGroundTexture(s, 'groundTile', 512, 96);
+     ground = s.add.tileSprite(worldWidth/2, GROUND_Y, worldWidth, 96, 'groundTile');
+-    s.physics.add.existing(ground, true);
++    // Keep ground at native scale for reliable collisions
++    s.physics.add.existing(ground, true);
++    // Ensure static body matches display after Y shift
++    ground.body.updateFromGameObject && ground.body.updateFromGameObject();
+
+     // Groups
+     wallsGroup = s.physics.add.staticGroup();
+@@ -119,10 +127,15 @@
+     const treePositions = generateTreePositions();
+     paintTreesAndGapsAsWater(s, treePositions, watersGroup, bridgesGroup, treeTrunksGroup);
+
+-    // Player + anims
++    // Player + anims (King stays original scale)
+     const frames = makeKingWalkFrames(s);
+     s.anims.create({ key:'king-walk', frames: frames.map(k=>({key:k})), frameRate:8, repeat:-1 });
+     s.anims.create({ key:'king-idle', frames:[{key:frames[0]}], frameRate:1, repeat:-1 });
+
+-    king = s.physics.add.sprite(worldWidth/2, GROUND_Y - 120, frames[0]);
++    king = s.physics.add.sprite(worldWidth/2, GROUND_Y - 120, frames[0]);
+     king.setCollideWorldBounds(true).setDragX(1200).setMaxVelocity(400, 2200).setScale(1.5);
+     king.body.setSize(36, 90, true);
+     s.physics.add.collider(king, ground);
+@@ -146,7 +159,7 @@
+     // Peasant camps
+     spawnPeasantCamps(s, 6);
+
+-    // Colliders
++    // Colliders
+     s.physics.add.collider(peasantsGroup, ground);
+     s.physics.add.collider(peasantsGroup, bridgesGroup);
+     s.physics.add.collider(peasantsGroup, treeTrunksGroup);
+@@ -274,10 +287,15 @@
+   function paintTreesAndGapsAsWater(s, treeXs, waterGroup, bridgeGroup, trunksGroup){
+     if (!s.textures.exists('tree1')) drawTreeTexture(s, 'tree1', 64, 108);
+     treeXs.forEach(px => {
+-      s.add.image(px, GROUND_Y - 10, 'tree1').setOrigin(0.5,1).setTint(0x2b5c45 + Math.floor(Math.random()*0x002200));
+-      trunksGroup.create(px, GROUND_Y-40, 'px').setDisplaySize(18,80).setVisible(false).refreshBody();
++      // Tree visuals scaled, trunk collider enlarged
++      s.add.image(px, GROUND_Y - 10, 'tree1')
++        .setOrigin(0.5,1)
++        .setTint(0x2b5c45 + Math.floor(Math.random()*0x002200))
++        .setScale(SCALE_WORLD);
++      trunksGroup.create(px, GROUND_Y-40, 'px')
++        .setDisplaySize(18*SCALE_WORLD, 80*SCALE_WORLD)
++        .setVisible(false).refreshBody();
+     });
+
+     // Find long gaps and make water with bridges
+@@ -304,14 +322,22 @@
+   function addWaterWithBridge(s, centerX, width, waterGroup, bridgeGroup){
+     const w = Phaser.Math.Clamp(width, 160, 420);
+     if (!s.textures.exists('waterTex')) drawWaterTexture(s, 'waterTex', 512, 64);
+     const tiles = Math.ceil(w/256);
+     for (let k=0;k<tiles;k++){
+-      const t = s.add.tileSprite(centerX - (tiles*256)/2 + k*256 + 128, GROUND_Y+16, 256, 64, 'waterTex');
++      const t = s.add.tileSprite(centerX - (tiles*256)/2 + k*256 + 128, GROUND_Y+16, 256, 64, 'waterTex');
++      t.setScale(SCALE_WORLD);
+       t.setDepth(-1);
+     }
+     if (!s.textures.exists('bridgeTex')) drawBridgeTexture(s, 'bridgeTex', 256, 32);
+     const bridgeWidth = w - 40;
+     const bridgeTiles = Math.ceil(bridgeWidth/256);
+     for (let k=0;k<bridgeTiles;k++){
+       const bx = centerX - (bridgeTiles*256)/2 + k*256 + 128;
+-      s.add.image(bx, GROUND_Y-8, 'bridgeTex');
+-      bridgeGroup.create(bx, GROUND_Y-12, 'px').setDisplaySize(256, 18).setVisible(false).refreshBody();
++      s.add.image(bx, GROUND_Y-8, 'bridgeTex').setScale(SCALE_WORLD);
++      bridgeGroup.create(bx, GROUND_Y-12, 'px')
++        .setDisplaySize(256*SCALE_WORLD, 18*SCALE_WORLD)
++        .setVisible(false).refreshBody();
+     }
+   }
+
+@@ -322,10 +348,13 @@
+     if (!s.textures.exists('tent')) drawTentTexture(s, 'tent', 120, 80);
+     if (!s.textures.exists('chest')) drawChestTexture(s, 'chest', 48, 32);
+-    s.add.image(cx-24, gy-12, 'campfire').setDepth(5);
+-    s.add.image(cx+70, gy-18, 'tent');
+-    s.add.image(cx+8, gy-14, 'chest');
++    s.add.image(cx-24, gy-12, 'campfire').setDepth(5).setScale(SCALE_WORLD);
++    s.add.image(cx+70, gy-18, 'tent').setScale(SCALE_WORLD);
++    s.add.image(cx+8, gy-14, 'chest').setScale(SCALE_WORLD);
+   }
+
+   function createWallMarkers(s, center, countPerSide, spacing){
+     const markers = [];
+     if (!s.textures.exists('marker')) drawMarkerTexture(s, 'marker', 16, 36);
+     for (let dir of [-1,1]){
+       for (let i=1;i<=countPerSide;i++){
+         const x = center + dir * i * spacing;
+-        const m = s.add.image(x, GROUND_Y-12, 'marker');
++        const m = s.add.image(x, GROUND_Y-12, 'marker').setScale(SCALE_WORLD);
+         m.data = { bought:false };
+         markers.push(m);
+       }
+     }
+     return markers;
+@@ -339,12 +368,16 @@
+     // Buy wall
+     const nearMarker = wallMarkers.find(m => Math.abs(m.x - king.x) < 38);
+     if (nearMarker && !nearMarker.data.bought && gold >= COST_WALL){
+       gold -= COST_WALL;
+       nearMarker.data.bought = true;
+       if (!s.textures.exists('wall')) drawWallTexture(s, 'wall', 24, 56);
+-      s.add.image(nearMarker.x, GROUND_Y-20, 'wall');
+-      const wall = wallsGroup.create(nearMarker.x, GROUND_Y-48, 'px').setDisplaySize(26, 80).setVisible(false).refreshBody();
++      s.add.image(nearMarker.x, GROUND_Y-20, 'wall').setScale(SCALE_WORLD);
++      const wall = wallsGroup.create(nearMarker.x, GROUND_Y-48, 'px')
++        .setDisplaySize(26*SCALE_WORLD, 80*SCALE_WORLD)
++        .setVisible(false).refreshBody();
+       wall.hp = WALL_MAX_HP;
+       nearMarker.setVisible(false);
+       updateHUD();
+       return;
+     }
+@@ -387,13 +420,17 @@
+   function spawnPeasantCamps(s, count){
+     if (!s.textures.exists('campPost')) drawCampPostTexture(s, 'campPost', 36, 44);
+     if (!s.textures.exists('peasant')) paintPeasantTexture(s,'peasant',28,32);
+     for (let i=0;i<count;i++){
+       const side = (Math.random()<0.5)?-1:1;
+       const dist = 400 + Math.random()* (worldWidth*0.4);
+       const x = worldWidth/2 + side*dist;
+-      s.add.image(x, GROUND_Y-20, 'campPost');
+-      const p = s.physics.add.sprite(x+Phaser.Math.Between(-30,30), GROUND_Y-120, 'peasant');
++      s.add.image(x, GROUND_Y-20, 'campPost').setScale(SCALE_WORLD);
++      const p = s.physics.add.sprite(x+Phaser.Math.Between(-30,30), GROUND_Y-120, 'peasant').setScale(SCALE_WORLD);
+       p.setCollideWorldBounds(true);
++      // Enlarge peasant body for scale
++      if (p.body && p.body.setSize) {
++        p.body.setSize(p.body.width, p.body.height, true);
++      }
+       p.hp = PEASANT_MAX_HP;
+       p.following = false;
+       peasantsGroup.add(p);
+     }
+   }
+@@ -468,9 +505,12 @@
+   function paintEnemyTexture(scene, key, w, h){
+     if (scene.textures.exists(key)) return;
+     const t = scene.textures.createCanvas(key, w, h);
+     const c = t.getContext();
+     c.fillStyle='#7a2b2b'; c.fillRect(0,0,w,h);
+     c.fillStyle='#000'; c.fillRect(6,8,w-12,h-16);
+     t.refresh();
+   }
+@@ -496,10 +536,13 @@
+   function drawCampfireTexture(scene, key, w, h){
+     if (scene.textures.exists(key)) return;
+     const t = scene.textures.createCanvas(key, w, h);
+     const c = t.getContext();
+-    c.fillStyle='#5b3b2b'; c.fillRect(w/2-12,h-10,24,8);
++    // Removed the brown wood base (looked like a “wall” near the camp)
++    // c.fillStyle='#5b3b2b'; c.fillRect(w/2-12,h-10,24,8);
+     c.fillStyle='#ff9933'; ellipse(c, w/2, h-20, 10,14,1);
+     c.fillStyle='#ffd966'; ellipse(c, w/2, h-22, 6,10,1);
+     t.refresh();
+   }
