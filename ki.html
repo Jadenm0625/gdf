@@ -1,0 +1,769 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Kingdom-style Forest — Phase 2+ (Shift+Scale)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
+  <style>
+    html,body{margin:0;height:100%;background:#0c0f14;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Arial}
+    #game{width:100%;height:100%}
+    .hud{position:fixed;left:12px;top:10px;color:#e9f4ff;text-shadow:0 1px 2px rgba(0,0,0,.6);font-size:16px;line-height:1.2;z-index:10}
+    .hud b{font-weight:700}
+    .err{position:fixed;right:12px;top:12px;max-width:44ch;padding:10px 12px;background:#2b1a1a;color:#ffd7d7;border:1px solid #a33;border-radius:8px;font-size:12px;z-index:9999;display:none;white-space:pre-wrap}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+</head>
+<body>
+<div class="hud" id="hud"></div>
+<div class="err" id="errbox"></div>
+<div id="game"></div>
+<script>
+/* Show errors on screen too */
+(function(){
+  const box = document.getElementById('errbox');
+  window.onerror = function(msg, src, line, col, err){
+    box.style.display = 'block';
+    box.textContent = (msg||'Error') + '\n' + (src||'') + ':' + (line||'?') + ':' + (col||'?') + '\n' + (err && err.stack ? err.stack : '');
+  };
+  if (typeof Phaser === 'undefined'){
+    box.style.display = 'block';
+    box.textContent = 'Phaser failed to load. Check your internet connection (CDN).';
+  }
+})();
+</script>
+<script>
+(() => {
+  if (typeof Phaser === 'undefined') return;
+
+  const DESIGN_W = 1920, DESIGN_H = 1018;
+  const WORLD_FEET = 1000, WORLD_PX = WORLD_FEET*12; // 12,000 px
+
+  // ==== New globals per your request ====
+  const Y_OFFSET = 100;             // shift everything (not background) down by +100px
+  const SCALE_WORLD = 3;            // scale everything 3x except background and KING
+  const GROUND_Y = (DESIGN_H - 120) + Y_OFFSET;
+
+  // Stats & costs
+  const PLAYER_MAX_HP = 15;
+  const PEASANT_MAX_HP = 4;
+  const ENEMY_MAX_HP = 3;
+  const WALL_MAX_HP = 2;
+  const DMG_ENEMY_HIT = 1;
+  const COST_WALL = 2;
+  const COST_RECRUIT = 1;
+
+  // Day/Night speeds (1..10 scale) – smaller = faster per your spec
+  const DAY_SPEED = 6;
+  const NIGHT_SPEED = 4;
+  const CYCLE_BASE = 0.08;
+
+  const config = {
+    type: Phaser.AUTO,
+    parent: 'game',
+    backgroundColor: '#0c0f14',
+    scale: {
+      mode: Phaser.Scale.FIT,
+      autoCenter: Phaser.Scale.CENTER_BOTH,
+      width: DESIGN_W,
+      height: DESIGN_H
+    },
+    physics: {
+      default: 'arcade',
+      arcade: { gravity: { y: 1800 }, debug: false }
+    },
+    scene: { preload, create, update }
+  };
+
+  new Phaser.Game(config);
+
+  // Scene vars
+  let cursors, keyA, keyD, keyW, keyE, keyZero;
+  let cam, ground, king;
+  let worldWidth = WORLD_PX;
+  let hudEl;
+  let gold = 6;
+  let playerHP = PLAYER_MAX_HP;
+
+  // Cycle / background
+  let sun, moon, lightOverlay;
+  let cycleT = 0.1; // 0..1 (0..0.5 day, 0.5..1 night)
+  let isDay = true;
+
+  // Entities
+  let wallMarkers = [];
+  let wallsGroup, peasantsGroup, enemiesGroup, bridgesGroup, watersGroup, treeTrunksGroup;
+
+  function preload(){}
+
+  function create() {
+    const s = this;
+    hudEl = document.getElementById('hud');
+
+    // Tiny texture for invisible physics colliders (avoids null texture issues)
+    makePixelTexture(s, 'px', 2, 2);
+
+    // Static background layers (do NOT move/scale)
+    makeBackgroundLayers(s);
+
+    // Ground
+    makeGroundTexture(s, 'groundTile', 512, 96);
+    ground = s.add.tileSprite(worldWidth/2, GROUND_Y, worldWidth, 96, 'groundTile');
+    s.physics.add.existing(ground, true);
+    ground.body.updateFromGameObject && ground.body.updateFromGameObject();
+
+    // Groups
+    wallsGroup = s.physics.add.staticGroup();
+    peasantsGroup = s.physics.add.group();
+    enemiesGroup = s.physics.add.group();
+    bridgesGroup = s.physics.add.staticGroup();
+    watersGroup  = s.physics.add.staticGroup();
+    treeTrunksGroup = s.physics.add.staticGroup();
+
+    // Trees + gaps -> water/bridges
+    const treePositions = generateTreePositions();
+    paintTreesAndGapsAsWater(s, treePositions, watersGroup, bridgesGroup, treeTrunksGroup);
+
+    // Player + anims (King stays original scale)
+    const frames = makeKingWalkFrames(s);
+    s.anims.create({ key:'king-walk', frames: frames.map(k=>({key:k})), frameRate:8, repeat:-1 });
+    s.anims.create({ key:'king-idle', frames:[{key:frames[0]}], frameRate:1, repeat:-1 });
+
+    king = s.physics.add.sprite(worldWidth/2, GROUND_Y - 120, frames[0]);
+    king.setCollideWorldBounds(true).setDragX(1200).setMaxVelocity(400, 2200).setScale(1.5);
+    king.body.setSize(36, 90, true);
+    s.physics.add.collider(king, ground);
+    s.physics.add.collider(king, bridgesGroup);
+    s.physics.add.collider(king, treeTrunksGroup);
+    s.physics.add.collider(king, wallsGroup);
+
+    // Start camp (center)
+    buildCampAt(s, worldWidth/2, GROUND_Y);
+
+    // Wall markers
+    wallMarkers = createWallMarkers(s, worldWidth/2, 9, 260);
+    s.physics.add.collider(peasantsGroup, wallsGroup);
+    s.physics.add.collider(enemiesGroup, wallsGroup);
+
+    // Peasant camps
+    spawnPeasantCamps(s, 6);
+
+    // Colliders
+    s.physics.add.collider(peasantsGroup, ground);
+    s.physics.add.collider(peasantsGroup, bridgesGroup);
+    s.physics.add.collider(peasantsGroup, treeTrunksGroup);
+
+    s.physics.add.collider(enemiesGroup, ground);
+    s.physics.add.collider(enemiesGroup, bridgesGroup);
+    s.physics.add.collider(enemiesGroup, treeTrunksGroup);
+
+    // Overlaps / damage
+    s.physics.add.overlap(enemiesGroup, wallsGroup, (enemy, wall)=>enemyAttackWall(s, enemy, wall));
+    s.physics.add.overlap(enemiesGroup, king, ()=>damagePlayer(s, DMG_ENEMY_HIT));
+    s.physics.add.overlap(enemiesGroup, peasantsGroup, (e,p)=>damagePeasant(s,p,DMG_ENEMY_HIT));
+
+    // Camera follows player; background stays put
+    s.physics.world.setBounds(0, 0, worldWidth, DESIGN_H);
+    cam = s.cameras.main;
+    cam.setBounds(0, 0, worldWidth, DESIGN_H);
+    cam.startFollow(king, true, 0.15, 0.15);
+
+    // Input
+    cursors = s.input.keyboard.createCursorKeys();
+    keyA = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
+    keyD = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
+    keyW = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W);
+    keyE = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+    keyZero = s.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ZERO);
+    keyZero.on('down', () => { if (!s.scale.isFullscreen) s.scale.startFullscreen(); else s.scale.stopFullscreen(); });
+
+    s.input.keyboard.on('keydown-E', () => tryInteract(s));
+
+    // Day/Night
+    makeCycleActors(s);
+
+    // HUD
+    updateHUD();
+
+    // Night enemy trickle
+    s.time.addEvent({ delay: 1000, loop: true, callback: () => { if (!isDay) spawnEnemyWave(s); }});
+  }
+
+  function update() {
+    const s = this;
+    const left = keyA.isDown || cursors.left.isDown;
+    const right = keyD.isDown || cursors.right.isDown;
+    const jump = keyW.isDown || cursors.up.isDown;
+    const onGround = king.body.blocked.down;
+
+    if (left) {
+      king.setAccelerationX(-1800);
+      king.setFlipX(true);
+      if (onGround) king.play('king-walk', true);
+    } else if (right) {
+      king.setAccelerationX(1800);
+      king.setFlipX(false);
+      if (onGround) king.play('king-walk', true);
+    } else {
+      king.setAccelerationX(0);
+      if (onGround) king.play('king-idle', true);
+    }
+    if (jump && onGround) king.setVelocityY(-650);
+
+    // Simple peasant follow/shuffle
+    peasantsGroup.children.iterate(p => {
+      if (!p || !p.active) return;
+      if (p.following){
+        const dx = king.x - p.x;
+        p.setVelocityX(Phaser.Math.Clamp(dx*2, -120, 120));
+        if (p.body.blocked.down && Math.abs(dx) < 32 && Math.random()<0.01){
+          p.setVelocityY(-600);
+        }
+      } else {
+        if (!p.nextShuffle || s.time.now > p.nextShuffle){
+          p.setVelocityX(Phaser.Math.Between(-40,40));
+          p.nextShuffle = s.time.now + Phaser.Math.Between(800, 1800);
+        }
+      }
+    });
+
+    // Cycle tick
+    tickDayNight(this, this.game.loop.delta/1000);
+  }
+
+  // ===== Background & Cycle (unchanged / no scaling applied) =====
+  function makeBackgroundLayers(s){
+    paintSkyTexture(s, 'sky_big', 4096, DESIGN_H);
+    s.add.image(0, 0, 'sky_big').setOrigin(0,0).setScrollFactor(0);
+    paintForestSilhouette(s, 'forest_far', 4096, 320, 0x0e1614);
+    s.add.image(0, DESIGN_H*0.58, 'forest_far').setOrigin(0,0.5).setScrollFactor(0).setAlpha(0.85);
+    paintForestSilhouette(s, 'forest_mid', 4096, 360, 0x15231a);
+    s.add.image(0, DESIGN_H*0.64, 'forest_mid').setOrigin(0,0.5).setScrollFactor(0).setAlpha(0.9);
+    paintFogTexture(s, 'fog_strip', 4096, 260);
+    s.add.image(0, DESIGN_H*0.67, 'fog_strip').setOrigin(0,0.5).setScrollFactor(0).setAlpha(0.35);
+  }
+
+  function makeCycleActors(s){
+    sun = s.add.circle(0,0,22,0xffe38a).setScrollFactor(0);
+    moon = s.add.circle(0,0,16,0xdfe6ff).setScrollFactor(0).setAlpha(0);
+    lightOverlay = s.add.rectangle(0,0,DESIGN_W,DESIGN_H,0x000000,0.0)
+                      .setOrigin(0,0).setScrollFactor(0).setDepth(1000);
+  }
+
+  function tickDayNight(s, dt){
+    const speed = isDay ? (CYCLE_BASE / DAY_SPEED) : (CYCLE_BASE / NIGHT_SPEED);
+    cycleT += speed * dt;
+    if (cycleT >= 1) cycleT -= 1;
+
+    isDay = (cycleT < 0.5);
+
+    // Sun (day half)
+    const tDay = Phaser.Math.Clamp(cycleT/0.5, 0, 1);
+    const sunX = DESIGN_W * (0.1 + 0.8 * tDay);
+    const sunY = DESIGN_H * (0.75 - 0.42 * Math.sin(Math.PI * tDay));
+    sun.setPosition(sunX, sunY).setAlpha(isDay ? 1 : 0);
+
+    // Moon (night half)
+    const tNight = Phaser.Math.Clamp((cycleT-0.5)/0.5, 0, 1);
+    const moonX = DESIGN_W * (0.9 - 0.8 * tNight);
+    const moonY = DESIGN_H * (0.40 + 0.32 * Math.sin(Math.PI * tNight));
+    moon.setPosition(moonX, moonY).setAlpha(isDay ? 0 : 1);
+
+    // Ambient
+    const darkness = isDay ? (0.25 - 0.25*Math.cos(Math.PI*tDay)) * 0.6
+                           : (0.35 + 0.45*Math.sin(Math.PI*tNight));
+    lightOverlay.fillAlpha = Phaser.Math.Clamp(darkness, 0, 0.85);
+  }
+
+  // ===== Terrain / Water / Bridges / Trees =====
+  function generateTreePositions(){
+    const positions = [];
+    const rng = mulberry32(1337);
+    let x = 80;
+    while (x < worldWidth-80){
+      const gapChance = rng();
+      if (gapChance < 0.12){
+        x += 180 + Math.floor(rng()*140);
+      } else {
+        const n = 4 + Math.floor(rng()*7);
+        for (let i=0;i<n;i++){
+          positions.push(x);
+          x += 28 + Math.floor(rng()*18);
+        }
+        x += 60 + Math.floor(rng()*100);
+      }
+    }
+    return positions.filter(px => Math.abs(px - worldWidth/2) > 160);
+  }
+
+  function paintTreesAndGapsAsWater(s, treeXs, waterGroup, bridgeGroup, trunksGroup){
+    if (!s.textures.exists('tree1')) drawTreeTexture(s, 'tree1', 64, 108);
+    treeXs.forEach(px => {
+      s.add.image(px, GROUND_Y - 10, 'tree1')
+        .setOrigin(0.5,1)
+        .setTint(0x2b5c45 + Math.floor(Math.random()*0x002200))
+        .setScale(SCALE_WORLD);
+      trunksGroup.create(px, GROUND_Y-40, 'px')
+        .setDisplaySize(18*SCALE_WORLD, 80*SCALE_WORLD)
+        .setVisible(false).refreshBody();
+    });
+
+    // Find long gaps and make water with bridges
+    const step = 24;
+    const occupied = new Array(Math.floor(worldWidth/step)).fill(false);
+    treeXs.forEach(px => { const idx = Math.floor(px/step); occupied[idx] = true; });
+
+    let i = 2;
+    while (i < occupied.length-2){
+      if (!occupied[i]){
+        let j = i;
+        while (j < occupied.length && !occupied[j]) j++;
+        const gapLen = (j-i)*step;
+        if (gapLen >= 180){
+          const wx = i*step + gapLen/2;
+          addWaterWithBridge(s, wx, gapLen-40, watersGroup, bridgesGroup);
+        }
+        i = j+1;
+      } else i++;
+    }
+  }
+
+  function addWaterWithBridge(s, centerX, width){
+    const w = Phaser.Math.Clamp(width, 160, 420);
+    if (!s.textures.exists('waterTex')) drawWaterTexture(s, 'waterTex', 512, 64);
+    const tiles = Math.ceil(w/256);
+    for (let k=0;k<tiles;k++){
+      const t = s.add.tileSprite(centerX - (tiles*256)/2 + k*256 + 128, GROUND_Y+16, 256, 64, 'waterTex');
+      t.setScale(SCALE_WORLD);
+      t.setDepth(-1);
+    }
+    if (!s.textures.exists('bridgeTex')) drawBridgeTexture(s, 'bridgeTex', 256, 32);
+    const bridgeWidth = w - 40;
+    const bridgeTiles = Math.ceil(bridgeWidth/256);
+    for (let k=0;k<bridgeTiles;k++){
+      const bx = centerX - (bridgeTiles*256)/2 + k*256 + 128;
+      s.add.image(bx, GROUND_Y-8, 'bridgeTex').setScale(SCALE_WORLD);
+      bridgesGroup.create(bx, GROUND_Y-12, 'px')
+        .setDisplaySize(256*SCALE_WORLD, 18*SCALE_WORLD)
+        .setVisible(false).refreshBody();
+    }
+  }
+
+  // ===== Camp / Walls / Interact =====
+  function buildCampAt(s, cx, gy){
+    if (!s.textures.exists('campfire')) drawCampfireTexture(s, 'campfire', 48, 48);
+    if (!s.textures.exists('tent')) drawTentTexture(s, 'tent', 120, 80);
+    if (!s.textures.exists('chest')) drawChestTexture(s, 'chest', 48, 32);
+    s.add.image(cx-24, gy-12, 'campfire').setDepth(5).setScale(SCALE_WORLD);
+    s.add.image(cx+70, gy-18, 'tent').setScale(SCALE_WORLD);
+    s.add.image(cx+8, gy-14, 'chest').setScale(SCALE_WORLD);
+  }
+
+  function createWallMarkers(s, center, countPerSide, spacing){
+    const markers = [];
+    if (!s.textures.exists('marker')) drawMarkerTexture(s, 'marker', 16, 36);
+    for (let dir of [-1,1]){
+      for (let i=1;i<=countPerSide;i++){
+        const x = center + dir * i * spacing;
+        const m = s.add.image(x, GROUND_Y-12, 'marker').setScale(SCALE_WORLD);
+        m.data = { bought:false };
+        markers.push(m);
+      }
+    }
+    return markers;
+  }
+
+  function tryInteract(s){
+    // Buy wall
+    const nearMarker = wallMarkers.find(m => Math.abs(m.x - king.x) < 38);
+    if (nearMarker && !nearMarker.data.bought && gold >= COST_WALL){
+      gold -= COST_WALL;
+      nearMarker.data.bought = true;
+      if (!s.textures.exists('wall')) drawWallTexture(s, 'wall', 24, 56);
+      s.add.image(nearMarker.x, GROUND_Y-20, 'wall').setScale(SCALE_WORLD);
+      const wall = wallsGroup.create(nearMarker.x, GROUND_Y-48, 'px')
+        .setDisplaySize(26*SCALE_WORLD, 80*SCALE_WORLD)
+        .setVisible(false).refreshBody();
+      wall.hp = WALL_MAX_HP;
+      nearMarker.setVisible(false);
+      updateHUD();
+      return;
+    }
+    // Recruit
+    const nearPeasant = peasantsGroup.getChildren().find(p => Phaser.Math.Distance.Between(p.x,p.y, king.x,king.y) < 48 && !p.following);
+    if (nearPeasant && gold >= COST_RECRUIT){
+      gold -= COST_RECRUIT;
+      nearPeasant.following = true;
+      updateHUD();
+      return;
+    }
+  }
+
+  // ===== Enemies / Damage =====
+  function spawnEnemyWave(s){
+    for (let edge of [24, worldWidth-24]){
+      if (Math.random() < 0.5){
+        if (!s.textures.exists('enemy')) paintEnemyTexture(s, 'enemy', 32, 32);
+        const e = s.physics.add.sprite(edge, GROUND_Y-100, 'enemy').setScale(SCALE_WORLD);
+        e.setCollideWorldBounds(true);
+        e.hp = ENEMY_MAX_HP;
+        e.setVelocityX(edge < worldWidth/2 ? 90+Math.random()*40 : -90 - Math.random()*40);
+        // expand body to match 3x sprite (enemy texture 32x32)
+        if (e.body && e.body.setSize) e.body.setSize(32*SCALE_WORLD, 32*SCALE_WORLD, true);
+        enemiesGroup.add(e);
+      }
+    }
+  }
+
+  function enemyAttackWall(s, enemy, wall){
+    if (!wall.hp) wall.hp = WALL_MAX_HP;
+    if (!enemy.nextHit || s.time.now > enemy.nextHit){
+      wall.hp -= DMG_ENEMY_HIT;
+      enemy.nextHit = s.time.now + 500;
+      if (wall.hp <= 0) wall.destroy();
+    }
+  }
+
+  function damagePlayer(s, dmg){
+    if (!king.nextHit || s.time.now > king.nextHit){
+      playerHP -= dmg;
+      king.nextHit = s.time.now + 500;
+      if (playerHP <= 0){
+        playerHP = PLAYER_MAX_HP;
+        gold = Math.max(0, gold-1);
+        king.setPosition(worldWidth/2, GROUND_Y-140);
+      }
+      updateHUD();
+    }
+  }
+
+  function damagePeasant(s, peasant, dmg){
+    if (!peasant.hp) peasant.hp = PEASANT_MAX_HP;
+    if (!peasant.nextHit || s.time.now > peasant.nextHit){
+      peasant.hp -= dmg;
+      peasant.nextHit = s.time.now + 500;
+      if (peasant.hp <= 0) peasant.destroy();
+    }
+  }
+
+  // ===== Peasants =====
+  function spawnPeasantCamps(s, count){
+    if (!s.textures.exists('campPost')) drawCampPostTexture(s, 'campPost', 36, 44);
+    if (!s.textures.exists('peasant')) paintPeasantTexture(s,'peasant',28,32);
+    for (let i=0;i<count;i++){
+      const side = (Math.random()<0.5)?-1:1;
+      const dist = 400 + Math.random()* (worldWidth*0.4);
+      const x = worldWidth/2 + side*dist;
+      s.add.image(x, GROUND_Y-20, 'campPost').setScale(SCALE_WORLD);
+      const p = s.physics.add.sprite(x+Phaser.Math.Between(-30,30), GROUND_Y-120, 'peasant').setScale(SCALE_WORLD);
+      p.setCollideWorldBounds(true);
+      // Peasant texture is 28x32; expand body to match 3x size
+      if (p.body && p.body.setSize) p.body.setSize(28*SCALE_WORLD, 32*SCALE_WORLD, true);
+      p.hp = PEASANT_MAX_HP;
+      p.following = false;
+      peasantsGroup.add(p);
+    }
+  }
+
+  // ===== HUD =====
+  function updateHUD(){
+    document.getElementById('hud').innerHTML =
+      `<b>Gold:</b> ${gold} &nbsp; <b>HP:</b> ${playerHP}/${PLAYER_MAX_HP} &nbsp; ` +
+      `<b>Time:</b> ${isDay?'Day':'Night'} &nbsp; ` +
+      `<b>Controls:</b> A/D move · W jump · E interact · 0 fullscreen`;
+  }
+
+  // ===== Texture & draw helpers =====
+  function makePixelTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const g = scene.make.graphics({ x:0,y:0, add:false });
+    g.fillStyle(0xffffff).fillRect(0,0,w,h);
+    g.generateTexture(key, w, h);
+    g.destroy();
+  }
+
+  function makeGroundTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const g = scene.make.graphics({ x:0,y:0, add:false });
+    g.fillStyle(0x3b412e).fillRect(0, h*0.25, w, h*0.75);
+    g.fillStyle(0x4d6b3a).fillRect(0, 0, w, h*0.28);
+    for (let i=0;i<400;i++){
+      g.fillStyle(0x2b2f22, 0.25).fillRect(Math.random()*w, (Math.random()*h*0.75)+h*0.25, 2, 2);
+    }
+    g.generateTexture(key, w, h);
+    g.destroy();
+  }
+
+  function drawTreeTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const tex = scene.textures.createCanvas(key, w, h);
+    const ctx = tex.getContext();
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = '#5f4631'; ctx.fillRect(w/2-4, h-46, 8, 46);
+    ctx.fillStyle = '#2f5b42';
+    ellipse(ctx, w/2, h-58, 26, 18, 0.95);
+    ellipse(ctx, w/2-12, h-68, 17, 12, 0.9);
+    ellipse(ctx, w/2+13, h-66, 19, 14, 0.9);
+    ellipse(ctx, w/2, h-78, 16, 10, 0.85);
+    tex.refresh();
+  }
+
+  function drawWaterTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const tex = scene.textures.createCanvas(key, w, h);
+    const ctx = tex.getContext();
+    const g = ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'#3b84a3'); g.addColorStop(1,'#1c536c');
+    ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+    for (let i=0;i<60;i++){
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fillRect(Math.random()*w, Math.random()*h, 24, 2);
+    }
+    tex.refresh();
+  }
+
+  function drawBridgeTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const tex = scene.textures.createCanvas(key, w, h);
+    const ctx = tex.getContext();
+    ctx.fillStyle = '#6b4b2c'; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    for (let i=0;i<8;i++) ctx.fillRect(i*(w/8),0,4,h);
+    tex.refresh();
+  }
+
+  function drawCampfireTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    // Removed the brown wood base under the campfire (looked like a wall)
+    // c.fillStyle='#5b3b2b'; c.fillRect(w/2-12,h-10,24,8);
+    c.fillStyle='#ff9933'; ellipse(c, w/2, h-20, 10,14,1);
+    c.fillStyle='#ffd966'; ellipse(c, w/2, h-22, 6,10,1);
+    t.refresh();
+  }
+
+  function drawTentTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.fillStyle='#2a3f6b';
+    c.beginPath(); c.moveTo(0,h-6); c.lineTo(w/2,h-60); c.lineTo(w,h-6); c.closePath(); c.fill();
+    c.fillStyle='#1b2744'; c.fillRect(w/2-6,h-40,12,34);
+    t.refresh();
+  }
+
+  function drawChestTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.fillStyle='#6b4b2c'; c.fillRect(0,h-22,w,22);
+    c.fillStyle='#c8b35a'; c.fillRect(w/2-4,h-22,8,22);
+    t.refresh();
+  }
+
+  function drawMarkerTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.fillStyle='#c8b35a'; c.fillRect(w/2-2, 4, 4, h-8);
+    c.fillStyle='#e1d995'; c.fillRect(2,0,w-4,8);
+    t.refresh();
+  }
+
+  function drawWallTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.fillStyle='#5a5a5a'; c.fillRect(0,0,w,h);
+    c.fillStyle='rgba(0,0,0,0.25)'; for(let i=0;i<5;i++) c.fillRect(i*(w/5),0,2,h);
+    t.refresh();
+  }
+
+  function drawCampPostTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    // Wooden post with banner
+    c.fillStyle = '#6b4b2c'; // post
+    c.fillRect(w/2-3, 6, 6, h-10);
+    c.fillStyle = '#c8b35a'; // cap
+    c.fillRect(w/2-5, 2, 10, 6);
+    c.fillStyle = '#3a5b7a'; // banner
+    c.fillRect(w/2+3, 12, w/2-6, 16);
+    t.refresh();
+  }
+
+  function paintEnemyTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.fillStyle='#7a2b2b'; c.fillRect(0,0,w,h);
+    c.fillStyle='#000'; c.fillRect(6,8,w-12,h-16);
+    t.refresh();
+  }
+
+  function paintPeasantTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.fillStyle='#bfa07a'; c.fillRect(w/2-6, 2, 12, 12); // head
+    c.fillStyle='#3d5b3a'; c.fillRect(w/2-8, 14, 16, 14); // tunic
+    c.fillStyle='#2a2a2a'; c.fillRect(w/2-10, 28, 8, 8);  // leg
+    c.fillRect(w/2+2, 28, 8, 8);
+    t.refresh();
+  }
+
+  function paintSkyTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    const g = c.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'#0b1b2a'); g.addColorStop(0.45,'#0f2a3b'); g.addColorStop(1,'#132f25');
+    c.fillStyle = g; c.fillRect(0,0,w,h);
+    t.refresh();
+  }
+
+  function paintForestSilhouette(scene, key, w, h, color){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    c.clearRect(0,0,w,h);
+    c.fillStyle = '#'+color.toString(16).padStart(6,'0');
+    c.fillRect(0, h-60, w, 60);
+    const rnd = mulberry32((key==='forest_far')?101:202);
+    for (let i=0;i<120;i++){
+      const x = Math.floor(rnd()*w);
+      const base = h-60 + Math.floor(rnd()*18);
+      const height = 40 + Math.floor(rnd()*70);
+      c.fillRect(x-1, base-height, 2, height);
+      ellipse(c, x, base-height+10, 14 + rnd()*14, 18 + rnd()*12, 1);
+    }
+    t.refresh();
+  }
+
+  function paintFogTexture(scene, key, w, h){
+    if (scene.textures.exists(key)) return;
+    const t = scene.textures.createCanvas(key, w, h);
+    const c = t.getContext();
+    const g = c.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'rgba(200,220,210,0)');
+    g.addColorStop(1,'rgba(200,220,210,0.6)');
+    c.fillStyle = g; c.fillRect(0,0,w,h);
+    t.refresh();
+  }
+
+  function ellipse(ctx, cx, cy, rx, ry, alpha=1){
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+  }
+
+  // ===== King (proportions + walk) =====
+  function makeKingWalkFrames(scene){
+    const torsoH = 36, headR = 16, legLen = 44, armLen = 36, limbThick = 8;
+    const skin=0xd8b78a,tunic=0x2d3a6b,belt=0x5b3b2b,boots=0x3a2c25,cape=0x7a1a1a,crown=0xffd24d,outline=0x111111;
+    const frameKeys = [];
+    const steps = [
+      { swing: 18, armOpp: -18 },
+      { swing: 6,  armOpp: -6  },
+      { swing:-18, armOpp: 18  },
+      { swing:-6,  armOpp: 6   },
+    ];
+    steps.forEach((st,i)=>{
+      const key = `king_walk_${i}`;
+      drawKing(scene, key, { torsoH, headR, legLen, armLen, limbThick, skin,tunic,belt,boots,cape,crown,outline, legSwingDeg:st.swing, armSwingDeg:st.armOpp });
+      frameKeys.push(key);
+    });
+    drawKing(scene, 'king_air', { torsoH, headR, legLen, armLen, limbThick, skin,tunic,belt,boots,cape,crown,outline, legSwingDeg:0, armSwingDeg:0, airborne:true });
+    return frameKeys;
+  }
+
+  function drawKing(scene, key, opts){
+    const { torsoH, headR, legLen, armLen, limbThick, skin,tunic,belt,boots,cape,crown,outline, legSwingDeg=0, armSwingDeg=0, airborne=false } = opts;
+    const W=160,H=160, cx=W/2, footY=H-8;
+    const g = scene.make.graphics({x:0,y:0,add:false});
+    const deg2rad = d=>d*Math.PI/180;
+
+    function line(x1,y1,x2,y2,thick,color){ g.lineStyle(thick,color,1); g.beginPath(); g.moveTo(x1,y1); g.lineTo(x2,y2); g.strokePath(); }
+    function rect(x,y,w,h,c){ g.fillStyle(c).fillRect(x,y,w,h); }
+    function circ(x,y,r,c){ g.fillStyle(c).fillCircle(x,y,r); }
+    function orect(x,y,w,h){ g.lineStyle(2, outline,1).strokeRect(x,y,w,h); }
+
+    const hipY = footY - legLen, hipX = cx;
+    const swing = deg2rad(legSwingDeg);
+    const stepLen = 10;
+    const frontHipX = hipX + Math.sin(swing)*stepLen;
+    const backHipX  = hipX - Math.sin(swing)*stepLen;
+    const kneeOffset = 12;
+
+    const armSwing = deg2rad(armSwingDeg);
+    const shoulderY = hipY - torsoH + 10;
+    const shoulderX = cx;
+
+    // Cape (behind)
+    g.fillStyle(cape,1);
+    g.fillRect(cx-24, hipY - torsoH + 6, 48, legLen + 18);
+    g.lineStyle(2, outline,0.7).strokeRect(cx-24, hipY - torsoH + 6, 48, legLen + 18);
+
+    // Back leg
+    leg(backHipX, hipY, -legSwingDeg);
+
+    // Torso
+    const torsoW = 34;
+    rect(cx - torsoW/2, hipY - torsoH, torsoW, torsoH, tunic);
+    orect(cx - torsoW/2, hipY - torsoH, torsoW, torsoH);
+
+    // Belt
+    rect(cx - torsoW/2, hipY - 14, torsoW, 6, belt);
+    g.lineStyle(1.5, outline,1).strokeRect(cx - torsoW/2, hipY - 14, torsoW, 6);
+
+    // Head + crown
+    const neckY = hipY - torsoH - 4;
+    circ(cx, neckY - headR, headR, skin);
+    g.lineStyle(2, outline,1).strokeCircle(cx, neckY - headR, headR);
+    g.fillStyle(crown,1);
+    g.fillRect(cx - headR + 2, neckY - headR*2 + 6, headR*2 - 4, 8);
+    for(let i=0;i<3;i++){
+      const sx = cx - headR + 6 + i*(headR*2-12)/2, sy = neckY - headR*2 + 6;
+      g.fillTriangle(sx,sy, sx+8,sy, sx+4,sy-8);
+    }
+    g.lineStyle(2, outline,1).strokeRect(cx - headR + 2, neckY - headR*2 + 6, headR*2 - 4, 8);
+
+    // Arms & front leg
+    arm(shoulderX-1, shoulderY, -armSwingDeg);
+    leg(frontHipX, hipY, legSwingDeg);
+    arm(shoulderX+1, shoulderY, armSwingDeg);
+
+    g.generateTexture(key, W, H); g.destroy();
+
+    function leg(hx,hy,deg){
+      const ang = deg2rad(deg);
+      const kx = hx + Math.sin(ang)*kneeOffset;
+      const ky = hy + Math.cos(ang)*kneeOffset;
+      const fx = hx + Math.sin(ang)*(legLen);
+      let fy = hy + Math.cos(ang)*(legLen);
+      if (!airborne) fy = Math.max(fy, H-10);
+      line(hx,hy,kx,ky, limbThick, 0x2a2a2a);
+      line(kx,ky,fx,fy, limbThick, 0x2a2a2a);
+      rect(fx-10, fy-6, 20, 8, boots);
+      g.lineStyle(2, outline,1).strokeRect(fx-10, fy-6, 20, 8);
+    }
+    function arm(sx,sy,deg){
+      const ang = deg2rad(deg);
+      const ex = sx + Math.sin(ang)*(armLen*0.55);
+      const ey = sy + Math.cos(ang)*(armLen*0.55);
+      const hx = sx + Math.sin(ang)*(armLen);
+      const hy = sy + Math.cos(ang)*(armLen);
+      line(sx,sy,ex,ey, limbThick-2, 0x262626);
+      line(ex,ey,hx,hy, limbThick-2, 0x262626);
+      circ(hx,hy,3.5, 0xd8b78a);
+      g.lineStyle(1.5, outline,1).strokeCircle(hx,hy,3.5);
+    }
+  }
+
+  // Utils
+  function mulberry32(a){ return function(){ var t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
+
+})();
+</script>
+</body>
+</html>
